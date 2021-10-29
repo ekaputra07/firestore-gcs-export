@@ -52,7 +52,10 @@ def to_items(project, result):
 def upload_items_to_gcs(client, items, bucket_name, object_path):
     if items:
         # create temp file to store the data
-        f = NamedTemporaryFile(delete=False)
+        f = NamedTemporaryFile(
+            delete=False,
+            suffix=object_path.replace('/', '-')
+        )
         filename = f.name
 
         # write jsonlines
@@ -70,16 +73,19 @@ def upload_items_to_gcs(client, items, bucket_name, object_path):
             f'[OK] {len(items)} rows uploaded to gs://{bucket_name}/{object_path}')
 
 
-def query(client, collection, batch_size, last_doc=None):
-    if last_doc:
-        result = client.collection(collection) \
-            .start_after(last_doc) \
-            .limit(batch_size) \
-            .get()
+def query(client, collection, batch_size, is_collection_group=False, cursor=None):
+    if is_collection_group:
+        if '/' in collection:
+            print('[ERR] Collection group must not contain "/"')
+            sys.exit(1)
+        q = client.collection_group(collection)
     else:
-        result = client.collection(collection) \
-            .limit(batch_size) \
-            .get()
+        q = client.collection(collection)
+
+    if cursor:
+        q = q.start_after(cursor)
+
+    result = q.limit(batch_size).get()
     return to_items(project=client.project, result=result)
 
 
@@ -95,16 +101,19 @@ if __name__ == '__main__':
         '--project', help='Firebase Project ID for project containing the Cloud Firestore database.', required=True)
     parser.add_argument('--source-collection',
                         help='The path of the the Cloud Firestore Collection to read from.', required=True)
+    parser.add_argument('--is-collection-group', action='store_true',
+                        help='Whether the source collection is a collection group')
     parser.add_argument(
         '--dest-bucket', help='The GCS bucket to store the export files.', required=True)
     parser.add_argument(
-        '--batch-size', help='The GCS bucket to store the export files.', default=500, type=int)
+        '--batch-size', help='The limit to use when reading from Firestore.', default=500, type=int)
     parser.add_argument(
         '--start-after', help='Firestore document ID to use as a start_after cursor for the query.')
     args = parser.parse_args()
 
     project = args.project
     collection = args.source_collection
+    is_collection_group = args.is_collection_group
     bucket = args.dest_bucket
     batch_size = args.batch_size
     start_after = args.start_after
@@ -112,35 +121,24 @@ if __name__ == '__main__':
     db = firestore.Client(project=project)
     gcs = storage.Client(project=project)
 
-    last_doc = None
+    cursor = None
     if start_after:
-        last_doc = db.collection(collection).document(start_after).get()
-        if not last_doc.exists:
+        cursor = db.collection(collection).document(start_after).get()
+        if not cursor.exists:
             print(f'[ERR] Document with id={start_after} does not exists.')
             sys.exit(1)
 
-    # first call
-    items, first, last = query(
-        client=db,
-        collection=collection,
-        batch_size=batch_size,
-        last_doc=last_doc)
-    last_doc = last if last else None
-    if last_doc:
+    while True:
+        items, first, last = query(
+            client=db,
+            collection=collection,
+            is_collection_group=is_collection_group,
+            batch_size=batch_size,
+            cursor=cursor)
+        cursor = last
+        if not cursor:
+            break
         upload_items_to_gcs(client=gcs,
                             items=items,
                             bucket_name=bucket,
                             object_path=create_gcs_object_path(collection, first, last))
-
-    while last_doc is not None:
-        items, first, last = query(
-            client=db,
-            collection=collection,
-            batch_size=batch_size,
-            last_doc=last_doc)
-        last_doc = last if last else None
-        if last_doc:
-            upload_items_to_gcs(client=gcs,
-                                items=items,
-                                bucket_name=bucket,
-                                object_path=create_gcs_object_path(collection, first, last))

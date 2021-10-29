@@ -69,6 +69,7 @@ python3 export.py \
 Optional arguments:
 
 ```bash
---batch-size 1000 (default=500)
---start-after abc-123 (document ID)
+--batch-size 1000 # default=500
+--start-after abc-123 # document ID
+--is-collection-group # if --source-collection is a collection group
 ```
