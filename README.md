@@ -8,7 +8,7 @@ The outputs are Jsonlines compatible with this extension: https://github.com/fir
 
 Because the one that comes with the extension somehow doesn't work anymore for me and I have no time to debug the cause. It was working previously but wasn't anymore, I created this quickly so that I can continue doing my job :)
 
-_If the official one works for you than you might don't need this._
+> If the official one works for you than you might not need this.
 
 ### This tool export to GCS instead writing directly to Big Query
 
