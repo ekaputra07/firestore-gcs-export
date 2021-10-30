@@ -39,13 +39,13 @@ Install dependencies:
 pip3 install -r requirements.txt
 ```
 
-Run it:
+### Exporting Collection
 
 ```bash
 python3 export.py \
 --project=my-project \
---source-collection=posts \
---dest-bucket=my-bucket
+--dest-bucket=my-bucket \
+--source-collection=posts
 ```
 
 You will see something like this when it running:
@@ -56,20 +56,46 @@ You will see something like this when it running:
 [OK] 500 rows uploaded to gs://my-bucket/firestore_posts_export/doc1001-to-doc1500.json
 ```
 
-You can stop it using `CTRL+C` and start it again from the last document it exported using the `--start-after` argument.
-
-```bash
-python3 export.py \
---project=my-project \
---source-collection=posts \
---dest-bucket=my-bucket \
---start-after=doc1500
-```
+You can stop it using `CTRL+C` and start it again to continue because it keep track of the last document id that successfully exported.
 
 Optional arguments:
 
 ```bash
 --batch-size 1000 # default=500
---start-after abc-123 # document ID
---is-collection-group # if --source-collection is a collection group
 ```
+
+### Exporting Collection Group
+
+To export collection group this tool take advantage of partition that can be used to export multiple partitions in parallel by using multi-threading.
+
+For small collection group you might not need it but I found it useful when the collection group is large.
+
+```bash
+python3 export.py \
+--project=my-project \
+--dest-bucket=my-bucket \
+--source-collection=ratings \
+--collection-group \
+--num-partitions=1000 \ # default 1
+--num-threads=4 # default 1
+```
+
+And you'll see something like this:
+
+```bash
+[INFO] 3 partition export configs created under workspace/ratings
+[INFO] Export starting...
+
+[Parallel(n_jobs=1)]: Using backend SequentialBackend with 1 concurrent workers.
+
+[OK] 19 rows uploaded to gs://my-bucket/firestore_ratings_export/part-2-doc101-to-doc200.json
+[OK] 61 rows uploaded to gs://my-bucket/firestore_ratings_export/part-1-doc1-to-doc100.json
+
+[Parallel(n_jobs=1)]: Done   2 out of   2 | elapsed:    3.6s finished
+```
+
+> Please note that the number of partition created might not the same as you're expecting.
+
+This tool keep track of the export job for each partition using a simple config file `workspace/{collection_group_name}/partition-*.json`.
+
+Each export job/thread will read one file, once finish they will delete the file and in case of error they will keep the file so we will be able re-run the jobs again later.

@@ -1,9 +1,12 @@
+import os
 import sys
 import argparse
+import json
 from google.cloud import firestore, storage
-from google.cloud.firestore_v1 import query
 from joblib import Parallel, delayed
 from worker import ExportConfig, Worker
+
+WORKSPACE_DIR = 'workspace/'
 
 parser = argparse.ArgumentParser(
     description='Export Firestore collection to GCS')
@@ -65,24 +68,57 @@ if __name__ == '__main__':
 
     # if multi-threading and partitioning specified, ignore the batch size since the
     # batch size we'll just load all documents inside that partition.
-    if is_collection_group and num_partitions > 1 and num_threads > 1:
-        jobs = []
+    if is_collection_group:
+        # get partitions
         partitions = db \
             .collection_group(collection) \
             .get_partitions(num_partitions)
-        counter = 1
-        while True:
-            try:
-                partition = next(partitions)
-                updated_config = config.set(query_partition=partition)
-                jobs.append(delayed(Worker.create)(
-                    f'part-{counter}', db, gcs, updated_config))
-                counter += 1
-            except StopIteration:
-                break
 
-        Parallel(n_jobs=num_threads, prefer='threads', verbose=1)(jobs)
+        # create partition config files
+        partition_dir = os.path.join(WORKSPACE_DIR, collection)
+        try:
+            # If partition dir not exists, start new export jobs
+            os.makedirs(partition_dir)
+            counter = 0
+            while True:
+                try:
+                    partition = next(partitions)
+                    counter += 1
+                    with open(os.path.join(partition_dir, f'partition-{counter}.json'), 'w') as file:
+                        conf = {
+                            'partition_num': counter
+                        }
+                        if partition.start_at:
+                            conf['start_at_path'] = partition.start_at.path
+                        if partition.end_at:
+                            conf['end_at_path'] = partition.end_at.path
+                        json.dump(conf, file)
+                except StopIteration:
+                    break
+            print(
+                f'[INFO] {counter} partition export configs created under {partition_dir}')
+
+        except FileExistsError:
+            print(
+                f'[INFO] Parition directory {partition_dir} exists, continuing unfinished jobs (if any).')
+
+        print('[INFO] Export starting...')
+        jobs = []
+
+        # Read partition config files and run the export jobs
+        for dirpath, dirnames, filenames in os.walk(partition_dir):
+            for filename in filenames:
+                config_file = os.path.join(dirpath, filename)
+                updated_config = config.set(partition_config_file=config_file)
+                jobs.append(delayed(Worker.create)(
+                    db, gcs, updated_config, WORKSPACE_DIR))
+
+        if jobs:
+            Parallel(n_jobs=num_threads, prefer='threads', verbose=1)(jobs)
+        else:
+            print(
+                f'[INFO] Do nothing. No partition config files found under {partition_dir}.')
 
     # else, process them normally.
     else:
-        Worker.create('part-1', db, gcs, config)
+        Worker.create(db, gcs, config, WORKSPACE_DIR)

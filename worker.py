@@ -7,17 +7,20 @@ from tempfile import NamedTemporaryFile
 from datetime import datetime
 from google.cloud import firestore, storage
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
-from google.cloud.firestore_v1.base_query import QueryPartition
 
 
 @dataclass
 class ExportConfig:
+    """
+    Configuration that specific to export job that
+    we need to pass to the worker.
+    """
     project: str
     source_collection: str
     dest_bucket: str
     batch_size: int = 500
     is_collection_group: bool = False
-    query_partition: QueryPartition = None
+    partition_config_file: str = None
 
     def set(self, **kwargs):
         return replace(self, **kwargs)
@@ -37,17 +40,18 @@ class ExportConfig:
 
 
 class Worker:
+    """
+    The actual code that doing the export job.
+    """
     IMPORT_TS = datetime(1970, 1, 1).isoformat()
     IMPORT_OPERATION = 'IMPORT'
     IMPORT_EVENT_ID = ''
 
     def __init__(self,
-                 id: str,
                  firestore_client: firestore.Client,
                  gcs_client: storage.Client,
                  export_config: ExportConfig,
                  workspace: str):
-        self.id = id
         self.firestore_client = firestore_client
         self.gcs_client = gcs_client
         self.workspace = workspace
@@ -56,6 +60,10 @@ class Worker:
             workspace, f'{export_config.snaked_source_collection}.cursor')
 
     def to_items(self, result):
+        """
+        Convert query result into dictionary that will match
+        the output of firebase-bigquery-export extension.
+        """
         items = []
         first_doc = None
         last_doc = None
@@ -92,6 +100,9 @@ class Worker:
         return items, first_doc, last_doc
 
     def upload_items_to_gcs(self, items, object_path):
+        """
+        Upload jsonlines file into GCS.
+        """
         bucket_name = self.export_config.dest_bucket
         if items:
             # create temp file to store the data
@@ -115,82 +126,123 @@ class Worker:
             print(
                 f'[OK] {len(items)} rows uploaded to gs://{bucket_name}/{object_path}')
 
-    def query(self, cursor=None):
-        is_collection_group = self.export_config.is_collection_group
+    def get_document(self, path):
+        doc = self.firestore_client.document(path).get()
+        return doc if doc.exists else None
+
+    def query_collection(self, cursor=None):
         source_collection = self.export_config.cleaned_source_collection
         batch_size = self.export_config.batch_size
 
-        if is_collection_group:
-            q = self.firestore_client.collection_group(source_collection)
-        else:
-            q = self.firestore_client.collection(source_collection)
+        q = self.firestore_client \
+            .collection(source_collection) \
+            .limit(batch_size)
 
         if cursor:
             q = q.start_after(cursor)
+        return self.to_items(q.get())
 
-        result = q.limit(batch_size).get()
-        return self.to_items(result)
+    def query_collection_group(self, start_at_path=None, end_at_path=None):
+        group = self.export_config.cleaned_source_collection
+        q = self.firestore_client.collection_group(group)
 
-    def create_gcs_object_path(self, first_doc, last_doc):
-        return f'firestore_{self.export_config.snaked_source_collection}_export/{self.id}-{first_doc.id}-to-{last_doc.id}.json'
+        if start_at_path:
+            # TODO: can we avoid this and create DocumentSnapshot from path?
+            start_doc = self.get_document(start_at_path)
+            if not start_doc:
+                raise Exception(
+                    f'Cursor document {start_at_path} does not exists!')
+            # partition start_at == previous partition end_at so here we use start_after
+            # to avoid duplicates.
+            q = q.start_after(start_doc)
 
-    def read_cursor(self):
+        if end_at_path:
+            # TODO: can we avoid this and create DocumentSnapshot from path?
+            end_doc = self.get_document(end_at_path)
+            if not end_doc:
+                raise Exception(
+                    f'Cursor document {end_at_path} does not exists!')
+            q = q.end_at(end_doc)
+        return self.to_items(q.get())
+
+    def create_gcs_object_path(self, first_doc, last_doc, prefix=''):
+        return f'firestore_{self.export_config.snaked_source_collection}_export/{prefix}{first_doc.id}-to-{last_doc.id}.json'
+
+    def read_cursor_id(self):
         try:
             with open(self.cursor_file, 'r') as file:
-                return file.readline()
+                return file.readline().strip()
         except FileNotFoundError:
             return None
 
-    def write_cursor(self, id: str):
+    def write_cursor_id(self, id: str):
         os.makedirs(os.path.dirname(self.cursor_file), exist_ok=True)
         with open(self.cursor_file, 'w') as file:
             file.write(id)
 
-    def start_in_partition(self):
-        query = self.export_config.query_partition.query()
-        result = query.get()
-        items, first, last = self.to_items(result)
-        object_path = self.create_gcs_object_path(first, last)
-        self.upload_items_to_gcs(
-            items=items,
-            object_path=object_path)
+    def export_collection_group(self):
+        """
+        We're exporting per partition based on partition config file path given
+        in export config.
+        """
+        path = self.export_config.partition_config_file
+        config = {}
+        try:
+            with open(path, 'r') as file:
+                config = json.load(file)
 
-    def start(self):
-        cursor_id = self.read_cursor()
-        cursor = None
+            partition_num = config.get('partition_num', 0)
+            start_at_path = config.get('start_at_path')
+            end_at_path = config.get('end_at_path')
 
-        if cursor_id:
-            source_collection = self.export_config.cleaned_source_collection
-            cursor = self.firestore_client \
-                .collection(source_collection) \
-                .document(cursor_id) \
-                .get()
-            if not cursor.exists:
-                print(
-                    f'[ERR] Document with id={cursor_id} does not exists.')
-                sys.exit(1)
-
-        while True:
-            items, first, last = self.query(cursor=cursor)
-            cursor = last
-            if not cursor:
-                break
-            object_path = self.create_gcs_object_path(first, last)
+            items, first, last = self.query_collection_group(
+                start_at_path=start_at_path, end_at_path=end_at_path)
+            object_path = self.create_gcs_object_path(
+                first, last, prefix=f'part-{partition_num}-')
             self.upload_items_to_gcs(
                 items=items,
                 object_path=object_path)
-            self.write_cursor(last.id)
+
+            # success, delete the partition config file
+            # os.unlink(path)
+        except Exception as e:
+            print(f'[ERR] Failed to export partition {partition_num}: {e}')
+
+    def export_collection(self):
+        cursor_id = self.read_cursor_id()
+        cursor = None
+        if cursor_id:
+            cursor = self.get_document(
+                f'{self.export_config.cleaned_source_collection}/{cursor_id}')
+            if not cursor:
+                print(
+                    f'[ERR] Document with id={cursor_id} does not exists!')
+                sys.exit(1)
+
+        while True:
+            try:
+                items, first, last = self.query_collection(cursor=cursor)
+                cursor = last
+                if not cursor:
+                    break
+                object_path = self.create_gcs_object_path(first, last)
+                self.upload_items_to_gcs(
+                    items=items,
+                    object_path=object_path)
+                self.write_cursor_id(last.id)
+            except Exception as e:
+                print(f'[ERR] Error occured during export: {e}')
+                break
 
     @staticmethod
     def create(
-            id: int,
             firestore_client: firestore.Client,
             gcs_client: storage.Client,
             export_config: ExportConfig,
-            workspace='workspace/'):
-        worker = Worker(id, firestore_client, gcs_client,
-                        export_config, workspace)
-        if export_config.query_partition:
-            worker.start_in_partition()
+            workspace: str):
+        worker = Worker(firestore_client, gcs_client, export_config, workspace)
+
+        if export_config.is_collection_group:
+            worker.export_collection_group()
         else:
-            worker.start()
+            worker.export_collection()
