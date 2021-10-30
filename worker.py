@@ -204,7 +204,7 @@ class Worker:
                 object_path=object_path)
 
             # success, delete the partition config file
-            # os.unlink(path)
+            os.unlink(path)
         except Exception as e:
             print(f'[ERR] Failed to export partition {partition_num}: {e}')
 
