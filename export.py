@@ -2,7 +2,7 @@ import os
 import sys
 import argparse
 import json
-from google.cloud import firestore, storage
+from google.cloud import firestore
 from joblib import Parallel, delayed
 from worker import ExportConfig, Worker
 
@@ -37,10 +37,10 @@ parser.add_argument(
     default=1,
     help='Number of partition to create to load the data; default=1 (for Collection Group only)')
 parser.add_argument(
-    '--num-threads',
+    '--num-workers',
     type=int,
     default=1,
-    help='Number of thread to use, useful for collection group export; default=1 (for Collection Group only)')
+    help='Number of worker to use, useful for collection group export; default=1 (for Collection Group only)')
 
 
 if __name__ == '__main__':
@@ -52,14 +52,13 @@ if __name__ == '__main__':
     bucket = args.dest_bucket
     batch_size = args.batch_size
     num_partitions = args.num_partitions
-    num_threads = args.num_threads
+    num_workers = args.num_workers
 
     if is_collection_group and '/' in collection:
         print('[ERR] Collection group must not contain "/"')
         sys.exit(1)
 
-    db = firestore.Client(project=project)
-    gcs = storage.Client(project=project)
+    db = firestore.Client()
     config = ExportConfig(project=project,
                           source_collection=collection,
                           dest_bucket=bucket,
@@ -110,15 +109,14 @@ if __name__ == '__main__':
             for filename in filenames:
                 config_file = os.path.join(dirpath, filename)
                 updated_config = config.set(partition_config_file=config_file)
-                jobs.append(delayed(Worker.create)(
-                    db, gcs, updated_config, WORKSPACE_DIR))
+                jobs.append(delayed(Worker.create)(updated_config, WORKSPACE_DIR))
 
         if jobs:
-            Parallel(n_jobs=num_threads, prefer='threads', verbose=1)(jobs)
+            Parallel(n_jobs=num_workers, verbose=1)(jobs)
         else:
             print(
                 f'[INFO] Do nothing. No partition config files found under {partition_dir}.')
 
     # else, process them normally.
     else:
-        Worker.create(db, gcs, config, WORKSPACE_DIR)
+        Worker.create(config, WORKSPACE_DIR)
