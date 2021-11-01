@@ -8,9 +8,6 @@ from datetime import datetime
 from google.cloud import firestore, storage
 from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 
-firestore_client = firestore.Client()
-gcs_client = storage.Client()
-
 
 @dataclass
 class ExportConfig:
@@ -51,8 +48,12 @@ class Worker:
     IMPORT_EVENT_ID = ''
 
     def __init__(self,
+                 firestore_client: firestore.Client,
+                 gcs_client: storage.Client,
                  export_config: ExportConfig,
                  workspace: str):
+        self.firestore_client = firestore_client
+        self.gcs_client = gcs_client
         self.workspace = workspace
         self.export_config = export_config
         self.cursor_file = os.path.join(
@@ -116,7 +117,7 @@ class Worker:
                 writer.write_all(items)
 
             # upload to GCS
-            bucket = gcs_client.get_bucket(bucket_name)
+            bucket = self.gcs_client.get_bucket(bucket_name)
             blob = bucket.blob(object_path)
             blob.upload_from_filename(filename=filename)
 
@@ -126,14 +127,14 @@ class Worker:
                 f'[OK] {len(items)} rows uploaded to gs://{bucket_name}/{object_path}')
 
     def get_document(self, path):
-        doc = firestore_client.document(path).get()
+        doc = self.firestore_client.document(path).get()
         return doc if doc.exists else None
 
     def query_collection(self, cursor=None):
         source_collection = self.export_config.cleaned_source_collection
         batch_size = self.export_config.batch_size
 
-        q = firestore_client \
+        q = self.firestore_client \
             .collection(source_collection) \
             .limit(batch_size)
 
@@ -143,7 +144,7 @@ class Worker:
 
     def query_collection_group(self, start_at_path=None, end_at_path=None):
         group = self.export_config.cleaned_source_collection
-        q = firestore_client.collection_group(group)
+        q = self.firestore_client.collection_group(group)
 
         if start_at_path:
             # TODO: can we avoid this and create DocumentSnapshot from path?
@@ -234,8 +235,13 @@ class Worker:
                 break
 
     @staticmethod
-    def create(export_config: ExportConfig, workspace: str):
-        worker = Worker(export_config, workspace)
+    def create(
+            firestore_client: firestore.Client,
+            gcs_client: storage.Client,
+            export_config: ExportConfig,
+            workspace: str):
+        worker = Worker(firestore_client, gcs_client, export_config, workspace)
+
         if export_config.is_collection_group:
             worker.export_collection_group()
         else:
