@@ -142,9 +142,9 @@ class Worker:
             q = q.start_after(cursor)
         return self.to_items(q.get())
 
-    def query_collection_group(self, start_at_path=None, end_at_path=None):
+    def query_collection_group(self, start_at_path=None, end_at_path=None, limit=500):
         group = self.export_config.cleaned_source_collection
-        q = self.firestore_client.collection_group(group)
+        q = self.firestore_client.collection_group(group).limit(limit)
 
         if start_at_path:
             # TODO: can we avoid this and create DocumentSnapshot from path?
@@ -163,7 +163,20 @@ class Worker:
                 raise Exception(
                     f'Cursor document {end_at_path} does not exists!')
             q = q.end_at(end_doc)
-        return self.to_items(q.get())
+
+        results = []
+        cursor = None
+        while True:
+            result = q.get()
+            if len(result) < limit:
+                results += result
+                break
+
+            results += result
+            cursor = result[-1]
+            q = q.start_after(cursor)
+
+        return self.to_items(results)
 
     def create_gcs_object_path(self, first_doc, last_doc, prefix=''):
         return f'firestore_{self.export_config.snaked_source_collection}_export/{prefix}{first_doc.id}-to-{last_doc.id}.json'
@@ -197,8 +210,10 @@ class Worker:
 
             items, first, last = self.query_collection_group(
                 start_at_path=start_at_path, end_at_path=end_at_path)
+
             object_path = self.create_gcs_object_path(
                 first, last, prefix=f'part-{partition_num}-')
+
             self.upload_items_to_gcs(
                 items=items,
                 object_path=object_path)
